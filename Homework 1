@@ -1,0 +1,1393 @@
+openapi: 3.0.3
+info:
+  title: Appraiser Connect API
+  description: >
+    A platform connecting customers with a qualified appraiser.
+    Users share a single accounts table differentiated by role (customer, appraiser, admin).
+    Customers submit appraisal requests; the appraiser converts them into work orders,
+    attaches documents and pictures, and delivers a valuation.
+  version: 2.0.0
+  contact:
+    name: Boris Nedelchev
+    email: bonedel4ev112@gmail.com
+
+servers:
+  - url: https://api.appraiser-connect.example.com/v1
+    description: Production server
+  - url: http://localhost:5000/v1
+    description: Local development server
+
+tags:
+  - name: Auth
+    description: Authentication — login and current-user info
+  - name: Users
+    description: Unified user accounts (customers, appraisers, admins)
+  - name: AppraisalRequests
+    description: Requests submitted by customers with property location and description
+  - name: WorkOrders
+    description: Work orders created by the appraiser from accepted requests
+  - name: WorkOrderDocuments
+    description: PDFs and pictures attached to a work order
+
+security:
+  - BearerAuth: []
+
+# ─────────────────────────────────────────────────────────────────
+# COMPONENTS
+# ─────────────────────────────────────────────────────────────────
+components:
+
+  securitySchemes:
+    BearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: >
+        All endpoints except POST /auth/login require a valid JWT token:
+        `Authorization: Bearer <token>`
+
+  # ── SCHEMAS ─────────────────────────────────────────────────────
+  schemas:
+
+    # AUTH ──────────────────────────────────────────────────────────
+    LoginRequest:
+      type: object
+      required: [email, password]
+      properties:
+        email:
+          type: string
+          format: email
+          maxLength: 256
+          example: john.doe@example.com
+        password:
+          type: string
+          format: password
+          minLength: 8
+          maxLength: 128
+          example: "S3cur3Pass!"
+
+    LoginResponse:
+      type: object
+      properties:
+        token:
+          type: string
+          description: JWT access token
+          example: "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9..."
+        expiresAt:
+          type: string
+          format: date-time
+          example: "2025-08-01T00:00:00Z"
+        user:
+          $ref: '#/components/schemas/User'
+
+    # USERS ─────────────────────────────────────────────────────────
+    UserRole:
+      type: string
+      enum: [customer, appraiser, admin]
+      description: Permission level of the account
+      example: customer
+
+    UserCreate:
+      type: object
+      required: [email, password, firstName, lastName, role]
+      properties:
+        email:
+          type: string
+          format: email
+          maxLength: 256
+          description: Unique login identifier
+          example: john.doe@example.com
+        password:
+          type: string
+          format: password
+          minLength: 8
+          maxLength: 128
+          description: Plain-text password; stored as bcrypt hash
+          example: "S3cur3Pass!"
+        firstName:
+          type: string
+          minLength: 1
+          maxLength: 100
+          example: John
+        lastName:
+          type: string
+          minLength: 1
+          maxLength: 100
+          example: Doe
+        phoneNumber:
+          type: string
+          maxLength: 20
+          pattern: '^\+?[0-9\s\-()\. ]{7,20}$'
+          nullable: true
+          example: "+359 88 123 4567"
+        role:
+          $ref: '#/components/schemas/UserRole'
+
+    UserUpdate:
+      type: object
+      description: >
+        Fields the authenticated user (or an admin) may update.
+        Role may only be changed by an admin.
+      properties:
+        firstName:
+          type: string
+          minLength: 1
+          maxLength: 100
+          example: John
+        lastName:
+          type: string
+          minLength: 1
+          maxLength: 100
+          example: Doe
+        phoneNumber:
+          type: string
+          maxLength: 20
+          pattern: '^\+?[0-9\s\-()\. ]{7,20}$'
+          nullable: true
+          example: "+359 88 123 4567"
+        isActive:
+          type: boolean
+          description: Admins only — deactivate/reactivate an account
+          example: true
+        role:
+          $ref: '#/components/schemas/UserRole'
+
+    User:
+      allOf:
+        - type: object
+          properties:
+            id:
+              type: integer
+              format: int64
+              readOnly: true
+              example: 1
+            email:
+              type: string
+              format: email
+              maxLength: 256
+              example: john.doe@example.com
+            firstName:
+              type: string
+              maxLength: 100
+              example: John
+            lastName:
+              type: string
+              maxLength: 100
+              example: Doe
+            phoneNumber:
+              type: string
+              maxLength: 20
+              nullable: true
+              example: "+359 88 123 4567"
+            role:
+              $ref: '#/components/schemas/UserRole'
+            isActive:
+              type: boolean
+              example: true
+            createdAt:
+              type: string
+              format: date-time
+              readOnly: true
+              example: "2025-01-15T10:30:00Z"
+            updatedAt:
+              type: string
+              format: date-time
+              readOnly: true
+              example: "2025-03-20T08:00:00Z"
+
+    UserList:
+      type: object
+      properties:
+        data:
+          type: array
+          items:
+            $ref: '#/components/schemas/User'
+        pagination:
+          $ref: '#/components/schemas/Pagination'
+
+    # APPRAISAL REQUESTS ────────────────────────────────────────────
+    RequestStatus:
+      type: string
+      enum: [PENDING, IN_REVIEW, ACCEPTED, REJECTED, CANCELLED]
+      description: >
+        Lifecycle of a customer request.
+        PENDING → IN_REVIEW → ACCEPTED (work order created) or REJECTED.
+        Customer may cancel while PENDING.
+      example: PENDING
+
+    AppraisalRequestCreate:
+      type: object
+      required: [messageBody, latitude, longitude]
+      properties:
+        messageBody:
+          type: string
+          minLength: 10
+          maxLength: 2000
+          description: Customer's description of the property and appraisal need
+          example: "I need an appraisal for my 3-bedroom apartment in the city centre."
+        latitude:
+          type: number
+          format: double
+          minimum: -90.0
+          maximum: 90.0
+          description: GPS latitude of the property
+          example: 42.1504
+        longitude:
+          type: number
+          format: double
+          minimum: -180.0
+          maximum: 180.0
+          description: GPS longitude of the property
+          example: 24.7501
+        cadastreNumber:
+          type: string
+          maxLength: 50
+          nullable: true
+          description: Bulgarian cadastre identifier, if known by the customer
+          example: "56784.504.9869"
+        address:
+          type: string
+          maxLength: 300
+          nullable: true
+          example: "ул. Иван Вазов 12, Пловдив 4000"
+        buildingType:
+          type: string
+          maxLength: 100
+          nullable: true
+          description: Type of property (e.g. apartment, house, commercial, land)
+          example: "Apartment"
+
+    AppraisalRequestUpdate:
+      type: object
+      description: >
+        Customers may update message/location while PENDING.
+        Appraisers/admins may also change the status.
+      properties:
+        messageBody:
+          type: string
+          minLength: 10
+          maxLength: 2000
+          example: "Updated description with additional details."
+        latitude:
+          type: number
+          format: double
+          minimum: -90.0
+          maximum: 90.0
+          example: 42.1504
+        longitude:
+          type: number
+          format: double
+          minimum: -180.0
+          maximum: 180.0
+          example: 24.7501
+        cadastreNumber:
+          type: string
+          maxLength: 50
+          nullable: true
+          example: "56784.504.9869"
+        address:
+          type: string
+          maxLength: 300
+          nullable: true
+          example: "ул. Иван Вазов 12, Пловдив 4000"
+        buildingType:
+          type: string
+          maxLength: 100
+          nullable: true
+          example: "House"
+        status:
+          $ref: '#/components/schemas/RequestStatus'
+
+    AppraisalRequest:
+      type: object
+      properties:
+        id:
+          type: integer
+          format: int64
+          readOnly: true
+          example: 42
+        customerId:
+          type: integer
+          format: int64
+          description: FK → users.id (role=customer)
+          example: 7
+        customerEmail:
+          type: string
+          format: email
+          readOnly: true
+          description: Denormalised for convenience; sourced from the linked user
+          example: john.doe@example.com
+        messageBody:
+          type: string
+          maxLength: 2000
+          example: "I need an appraisal for my 3-bedroom apartment."
+        latitude:
+          type: number
+          format: double
+          example: 42.1504
+        longitude:
+          type: number
+          format: double
+          example: 24.7501
+        cadastreNumber:
+          type: string
+          maxLength: 50
+          nullable: true
+          example: "56784.504.9869"
+        address:
+          type: string
+          maxLength: 300
+          nullable: true
+          example: "ул. Иван Вазов 12, Пловдив 4000"
+        buildingType:
+          type: string
+          maxLength: 100
+          nullable: true
+          example: "Apartment"
+        status:
+          $ref: '#/components/schemas/RequestStatus'
+        createdAt:
+          type: string
+          format: date-time
+          readOnly: true
+          example: "2025-02-10T14:00:00Z"
+        updatedAt:
+          type: string
+          format: date-time
+          readOnly: true
+          example: "2025-02-12T09:30:00Z"
+
+    AppraisalRequestList:
+      type: object
+      properties:
+        data:
+          type: array
+          items:
+            $ref: '#/components/schemas/AppraisalRequest'
+        pagination:
+          $ref: '#/components/schemas/Pagination'
+
+    # WORK ORDERS ───────────────────────────────────────────────────
+    WorkOrderStatus:
+      type: string
+      enum: [OPEN, IN_PROGRESS, COMPLETED, CLOSED]
+      description: >
+        Appraiser workflow status of the work order.
+        OPEN (just created) → IN_PROGRESS → COMPLETED (valuation filled) → CLOSED.
+      example: OPEN
+
+    WorkOrderCreate:
+      type: object
+      required: [requestId, cadastreNumber, address, buildingType]
+      description: >
+        Created by the appraiser when accepting a request.
+        The three property fields must be verified and filled by the appraiser;
+        they may pre-populate from the request but are required here.
+      properties:
+        requestId:
+          type: integer
+          format: int64
+          description: FK → appraisal_requests.id
+          example: 42
+        cadastreNumber:
+          type: string
+          minLength: 1
+          maxLength: 50
+          description: Verified Bulgarian cadastre identifier
+          example: "56784.504.9869"
+        address:
+          type: string
+          minLength: 1
+          maxLength: 300
+          description: Verified property address
+          example: "ул. Иван Вазов 12, Пловдив 4000"
+        buildingType:
+          type: string
+          minLength: 1
+          maxLength: 100
+          description: Verified building/property type
+          example: "Apartment"
+        notes:
+          type: string
+          maxLength: 3000
+          nullable: true
+          description: Internal appraiser notes, findings, methodology
+          example: "Property is in good structural condition. Market comps used."
+        estimatedValue:
+          type: number
+          format: double
+          minimum: 0.0
+          nullable: true
+          description: Estimated market value in BGN; may be filled later
+          example: 125000.00
+
+    WorkOrderUpdate:
+      type: object
+      description: Fields the appraiser (or admin) may update on an existing work order.
+      properties:
+        cadastreNumber:
+          type: string
+          minLength: 1
+          maxLength: 50
+          example: "56784.504.9869"
+        address:
+          type: string
+          minLength: 1
+          maxLength: 300
+          example: "ул. Иван Вазов 12, Пловдив 4000"
+        buildingType:
+          type: string
+          minLength: 1
+          maxLength: 100
+          example: "House"
+        notes:
+          type: string
+          maxLength: 3000
+          nullable: true
+          example: "Revised after second site visit."
+        estimatedValue:
+          type: number
+          format: double
+          minimum: 0.0
+          nullable: true
+          example: 130000.00
+        status:
+          $ref: '#/components/schemas/WorkOrderStatus'
+
+    WorkOrder:
+      type: object
+      properties:
+        id:
+          type: integer
+          format: int64
+          readOnly: true
+          example: 5
+        requestId:
+          type: integer
+          format: int64
+          example: 42
+        appraiserId:
+          type: integer
+          format: int64
+          description: FK → users.id (role=appraiser)
+          example: 2
+        cadastreNumber:
+          type: string
+          maxLength: 50
+          example: "56784.504.9869"
+        address:
+          type: string
+          maxLength: 300
+          example: "ул. Иван Вазов 12, Пловдив 4000"
+        buildingType:
+          type: string
+          maxLength: 100
+          example: "Apartment"
+        notes:
+          type: string
+          maxLength: 3000
+          nullable: true
+          example: "Property is in good structural condition."
+        estimatedValue:
+          type: number
+          format: double
+          nullable: true
+          example: 125000.00
+        status:
+          $ref: '#/components/schemas/WorkOrderStatus'
+        documents:
+          type: array
+          readOnly: true
+          description: Attached PDFs and pictures (populated on detail view)
+          items:
+            $ref: '#/components/schemas/WorkOrderDocument'
+        createdAt:
+          type: string
+          format: date-time
+          readOnly: true
+          example: "2025-02-15T11:00:00Z"
+        updatedAt:
+          type: string
+          format: date-time
+          readOnly: true
+          example: "2025-02-20T10:00:00Z"
+
+    WorkOrderList:
+      type: object
+      properties:
+        data:
+          type: array
+          items:
+            $ref: '#/components/schemas/WorkOrder'
+        pagination:
+          $ref: '#/components/schemas/Pagination'
+
+    # WORK ORDER DOCUMENTS ──────────────────────────────────────────
+    FileType:
+      type: string
+      enum: [pdf, image]
+      description: Category of the uploaded file
+      example: pdf
+
+    WorkOrderDocumentCreate:
+      type: object
+      required: [fileName, fileUrl, fileType]
+      properties:
+        fileName:
+          type: string
+          minLength: 1
+          maxLength: 255
+          description: Original file name including extension
+          example: "valuation-report.pdf"
+        fileUrl:
+          type: string
+          format: uri
+          maxLength: 500
+          description: >
+            URL to the stored file (cloud storage).
+            The file itself is uploaded separately to storage before calling this endpoint.
+          example: "https://storage.example.com/work-orders/5/valuation-report.pdf"
+        fileType:
+          $ref: '#/components/schemas/FileType'
+
+    WorkOrderDocument:
+      allOf:
+        - $ref: '#/components/schemas/WorkOrderDocumentCreate'
+        - type: object
+          properties:
+            id:
+              type: integer
+              format: int64
+              readOnly: true
+              example: 11
+            workOrderId:
+              type: integer
+              format: int64
+              readOnly: true
+              example: 5
+            uploadedById:
+              type: integer
+              format: int64
+              readOnly: true
+              description: FK → users.id — who uploaded the file
+              example: 2
+            uploadedAt:
+              type: string
+              format: date-time
+              readOnly: true
+              example: "2025-02-18T14:00:00Z"
+
+    WorkOrderDocumentList:
+      type: object
+      properties:
+        data:
+          type: array
+          items:
+            $ref: '#/components/schemas/WorkOrderDocument'
+        pagination:
+          $ref: '#/components/schemas/Pagination'
+
+    # SHARED ────────────────────────────────────────────────────────
+    Pagination:
+      type: object
+      properties:
+        page:
+          type: integer
+          minimum: 1
+          example: 1
+        pageSize:
+          type: integer
+          minimum: 1
+          maximum: 100
+          example: 10
+        totalItems:
+          type: integer
+          example: 47
+        totalPages:
+          type: integer
+          example: 5
+
+    ProblemDetails:
+      type: object
+      description: RFC 7807 Problem Details for HTTP APIs
+      properties:
+        type:
+          type: string
+          format: uri
+          example: "https://tools.ietf.org/html/rfc7231#section-6.5.1"
+        title:
+          type: string
+          example: "Validation Error"
+        status:
+          type: integer
+          example: 400
+        detail:
+          type: string
+          example: "One or more fields failed validation."
+        instance:
+          type: string
+          format: uri
+          example: "/v1/users"
+        errors:
+          type: object
+          additionalProperties:
+            type: array
+            items:
+              type: string
+          example:
+            email: ["Email is already registered."]
+            role: ["Only admins may assign the appraiser role."]
+
+  # ── COMMON RESPONSES ────────────────────────────────────────────
+  responses:
+    Unauthorized:
+      description: Missing or invalid JWT token
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ProblemDetails'
+    Forbidden:
+      description: Authenticated but not authorized for this action
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ProblemDetails'
+    NotFound:
+      description: Requested resource not found
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ProblemDetails'
+    BadRequest:
+      description: Validation error or malformed request body
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ProblemDetails'
+    Conflict:
+      description: Unique constraint or state conflict
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ProblemDetails'
+
+  # ── COMMON PARAMETERS ───────────────────────────────────────────
+  parameters:
+    IdPath:
+      name: id
+      in: path
+      required: true
+      schema:
+        type: integer
+        format: int64
+      description: Resource primary key
+    WorkOrderIdPath:
+      name: workOrderId
+      in: path
+      required: true
+      schema:
+        type: integer
+        format: int64
+      description: Work order primary key
+    PageParam:
+      name: page
+      in: query
+      required: false
+      schema:
+        type: integer
+        minimum: 1
+        default: 1
+    PageSizeParam:
+      name: pageSize
+      in: query
+      required: false
+      schema:
+        type: integer
+        minimum: 1
+        maximum: 100
+        default: 10
+    SortByParam:
+      name: sortBy
+      in: query
+      required: false
+      schema:
+        type: string
+      description: Field name to sort by (e.g. createdAt, lastName)
+    SortOrderParam:
+      name: sortOrder
+      in: query
+      required: false
+      schema:
+        type: string
+        enum: [asc, desc]
+        default: asc
+
+# ─────────────────────────────────────────────────────────────────
+# PATHS
+# ─────────────────────────────────────────────────────────────────
+paths:
+
+  # ══ AUTH ══════════════════════════════════════════════════════════
+  /auth/login:
+    post:
+      tags: [Auth]
+      summary: Login
+      description: >
+        Authenticates any user (customer, appraiser, admin) by email and password.
+        Returns a JWT and the authenticated user's profile.
+        No authentication required.
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/LoginRequest'
+      responses:
+        '200':
+          description: Successful login
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/LoginResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          description: Invalid email or password
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ProblemDetails'
+
+  /auth/me:
+    get:
+      tags: [Auth]
+      summary: Current user profile
+      description: Returns the profile of the currently authenticated user.
+      responses:
+        '200':
+          description: Authenticated user profile
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/User'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+  # ══ USERS ═════════════════════════════════════════════════════════
+  /users:
+    get:
+      tags: [Users]
+      summary: List users
+      description: >
+        Returns a paginated, sortable list of user accounts.
+        Accessible by appraiser and admin roles only.
+        Supports filtering by role, lastName (partial), and isActive.
+      parameters:
+        - $ref: '#/components/parameters/PageParam'
+        - $ref: '#/components/parameters/PageSizeParam'
+        - $ref: '#/components/parameters/SortByParam'
+        - $ref: '#/components/parameters/SortOrderParam'
+        - name: role
+          in: query
+          required: false
+          schema:
+            $ref: '#/components/schemas/UserRole'
+          description: Filter by role
+        - name: lastName
+          in: query
+          required: false
+          schema:
+            type: string
+            maxLength: 100
+          description: Partial, case-insensitive match on last name
+          example: Doe
+        - name: isActive
+          in: query
+          required: false
+          schema:
+            type: boolean
+          description: Filter by active/inactive status
+      responses:
+        '200':
+          description: Paginated list of users
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UserList'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+
+    post:
+      tags: [Users]
+      summary: Register a new user
+      description: >
+        Creates a new user account.
+        - Unauthenticated callers may only create accounts with role=customer.
+        - Authenticated admins may create accounts with any role.
+        Email must be unique. Password is hashed (bcrypt) before storage.
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UserCreate'
+      responses:
+        '201':
+          description: User created
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/User'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '403':
+          description: Non-admin attempted to assign appraiser or admin role
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ProblemDetails'
+        '409':
+          $ref: '#/components/responses/Conflict'
+
+  /users/{id}:
+    parameters:
+      - $ref: '#/components/parameters/IdPath'
+
+    get:
+      tags: [Users]
+      summary: Get user by ID
+      description: >
+        Customers may only fetch their own profile.
+        Appraisers and admins may fetch any user.
+      responses:
+        '200':
+          description: User found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/User'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+    put:
+      tags: [Users]
+      summary: Update user
+      description: >
+        Customers may update their own profile (firstName, lastName, phoneNumber).
+        Admins may update any field including role and isActive.
+        Email cannot be changed; password changes are handled separately (not in scope).
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UserUpdate'
+      responses:
+        '200':
+          description: User updated
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/User'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+    delete:
+      tags: [Users]
+      summary: Delete user
+      description: >
+        Admins only. Soft-deletes the account (sets isActive=false).
+        Associated requests and work orders are retained for audit.
+      responses:
+        '204':
+          description: User deactivated
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  # ══ APPRAISAL REQUESTS ════════════════════════════════════════════
+  /appraisal-requests:
+    get:
+      tags: [AppraisalRequests]
+      summary: List appraisal requests
+      description: >
+        Customers see only their own requests.
+        Appraisers and admins see all requests.
+        Supports filtering by status and buildingType, and sorting by any field.
+      parameters:
+        - $ref: '#/components/parameters/PageParam'
+        - $ref: '#/components/parameters/PageSizeParam'
+        - $ref: '#/components/parameters/SortByParam'
+        - $ref: '#/components/parameters/SortOrderParam'
+        - name: status
+          in: query
+          required: false
+          schema:
+            $ref: '#/components/schemas/RequestStatus'
+          description: Filter by request status
+        - name: buildingType
+          in: query
+          required: false
+          schema:
+            type: string
+            maxLength: 100
+          description: Partial, case-insensitive match on building type
+          example: Apartment
+      responses:
+        '200':
+          description: Paginated list of appraisal requests
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AppraisalRequestList'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+    post:
+      tags: [AppraisalRequests]
+      summary: Submit a new appraisal request
+      description: >
+        Customers only. The authenticated user's ID is automatically assigned
+        as customerId. Initial status is always PENDING.
+        cadastreNumber, address, and buildingType are optional at submission time.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AppraisalRequestCreate'
+      responses:
+        '201':
+          description: Request created
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AppraisalRequest'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          description: Authenticated user is not a customer
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ProblemDetails'
+
+  /appraisal-requests/{id}:
+    parameters:
+      - $ref: '#/components/parameters/IdPath'
+
+    get:
+      tags: [AppraisalRequests]
+      summary: Get appraisal request by ID
+      description: >
+        Customers may only fetch their own requests.
+        Appraisers and admins may fetch any request.
+      responses:
+        '200':
+          description: Request found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AppraisalRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+    put:
+      tags: [AppraisalRequests]
+      summary: Update appraisal request
+      description: >
+        Customers may edit messageBody, coordinates, and the three property fields
+        only while status=PENDING.
+        Appraisers and admins may additionally change status
+        (e.g. PENDING → IN_REVIEW → ACCEPTED/REJECTED).
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AppraisalRequestUpdate'
+      responses:
+        '200':
+          description: Request updated
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AppraisalRequest'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+    delete:
+      tags: [AppraisalRequests]
+      summary: Delete appraisal request
+      description: >
+        Customers may delete their own request only while status=PENDING.
+        Admins may delete any request in any status.
+        Deletion is hard-delete; linked work orders must be closed first.
+      responses:
+        '204':
+          description: Request deleted
+        '400':
+          description: Request is not in a deletable state
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ProblemDetails'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  # ══ WORK ORDERS ═══════════════════════════════════════════════════
+  /work-orders:
+    get:
+      tags: [WorkOrders]
+      summary: List work orders
+      description: >
+        Appraisers see only their own work orders.
+        Admins see all work orders.
+        Customers do not have access to this endpoint (403).
+        Supports filtering by status and buildingType.
+      parameters:
+        - $ref: '#/components/parameters/PageParam'
+        - $ref: '#/components/parameters/PageSizeParam'
+        - $ref: '#/components/parameters/SortByParam'
+        - $ref: '#/components/parameters/SortOrderParam'
+        - name: status
+          in: query
+          required: false
+          schema:
+            $ref: '#/components/schemas/WorkOrderStatus'
+          description: Filter by work order status
+        - name: buildingType
+          in: query
+          required: false
+          schema:
+            type: string
+            maxLength: 100
+          description: Partial, case-insensitive match on building type
+          example: Apartment
+      responses:
+        '200':
+          description: Paginated list of work orders
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/WorkOrderList'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+
+    post:
+      tags: [WorkOrders]
+      summary: Create a work order from a request
+      description: >
+        Appraisers and admins only.
+        Accepts a requestId and the verified property fields.
+        Automatically sets the linked request status to ACCEPTED and
+        assigns the authenticated appraiser as appraiserId.
+        Initial work order status is OPEN.
+        A request may have at most one active (non-CLOSED) work order.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/WorkOrderCreate'
+      responses:
+        '201':
+          description: Work order created
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/WorkOrder'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          description: Linked appraisal request not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ProblemDetails'
+        '409':
+          description: An active work order already exists for this request
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ProblemDetails'
+
+  /work-orders/{id}:
+    parameters:
+      - $ref: '#/components/parameters/IdPath'
+
+    get:
+      tags: [WorkOrders]
+      summary: Get work order by ID
+      description: >
+        Appraisers may only fetch their own work orders.
+        Admins may fetch any work order.
+        Response includes the full documents array.
+      responses:
+        '200':
+          description: Work order found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/WorkOrder'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+    put:
+      tags: [WorkOrders]
+      summary: Update work order
+      description: >
+        Appraisers may update their own work orders while status is not CLOSED.
+        Admins may update any work order.
+        Updating estimatedValue and setting status=COMPLETED represents
+        delivering the appraisal.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/WorkOrderUpdate'
+      responses:
+        '200':
+          description: Work order updated
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/WorkOrder'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+    delete:
+      tags: [WorkOrders]
+      summary: Delete work order
+      description: >
+        Admins only. Only OPEN work orders may be deleted.
+        Deleting a work order reverts the linked request status back to PENDING.
+        All attached documents are also deleted.
+      responses:
+        '204':
+          description: Work order deleted
+        '400':
+          description: Work order is not in a deletable state (must be OPEN)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ProblemDetails'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  # ══ WORK ORDER DOCUMENTS ══════════════════════════════════════════
+  /work-orders/{workOrderId}/documents:
+    parameters:
+      - $ref: '#/components/parameters/WorkOrderIdPath'
+
+    get:
+      tags: [WorkOrderDocuments]
+      summary: List documents for a work order
+      description: >
+        Returns all PDFs and images attached to the work order.
+        Appraisers may only list documents on their own work orders.
+        Admins may list documents on any work order.
+        Supports filtering by fileType and sorting by uploadedAt.
+      parameters:
+        - $ref: '#/components/parameters/PageParam'
+        - $ref: '#/components/parameters/PageSizeParam'
+        - $ref: '#/components/parameters/SortByParam'
+        - $ref: '#/components/parameters/SortOrderParam'
+        - name: fileType
+          in: query
+          required: false
+          schema:
+            $ref: '#/components/schemas/FileType'
+          description: Filter by file type (pdf or image)
+      responses:
+        '200':
+          description: Paginated list of documents
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/WorkOrderDocumentList'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          description: Work order not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ProblemDetails'
+
+    post:
+      tags: [WorkOrderDocuments]
+      summary: Attach a document to a work order
+      description: >
+        Appraisers and admins only.
+        The file must already be uploaded to cloud storage; this endpoint
+        registers the file metadata (name, URL, type) on the work order.
+        uploadedById is automatically set to the authenticated user's ID.
+        A work order may have at most 50 documents.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/WorkOrderDocumentCreate'
+      responses:
+        '201':
+          description: Document record created
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/WorkOrderDocument'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          description: Work order not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ProblemDetails'
+        '409':
+          description: Document limit (50) reached for this work order
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ProblemDetails'
+
+  /work-orders/{workOrderId}/documents/{id}:
+    parameters:
+      - $ref: '#/components/parameters/WorkOrderIdPath'
+      - $ref: '#/components/parameters/IdPath'
+
+    get:
+      tags: [WorkOrderDocuments]
+      summary: Get document metadata by ID
+      description: Returns the metadata record for a single attached document.
+      responses:
+        '200':
+          description: Document found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/WorkOrderDocument'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+    put:
+      tags: [WorkOrderDocuments]
+      summary: Update document metadata
+      description: >
+        Allows renaming the file or correcting the URL.
+        The fileType cannot be changed after upload.
+        Only the uploader or an admin may update a document record.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                fileName:
+                  type: string
+                  minLength: 1
+                  maxLength: 255
+                  example: "final-valuation-report.pdf"
+                fileUrl:
+                  type: string
+                  format: uri
+                  maxLength: 500
+                  example: "https://storage.example.com/work-orders/5/final-valuation-report.pdf"
+      responses:
+        '200':
+          description: Document metadata updated
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/WorkOrderDocument'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+    delete:
+      tags: [WorkOrderDocuments]
+      summary: Remove a document from a work order
+      description: >
+        Deletes the metadata record.
+        The file in cloud storage is not automatically deleted.
+        Only the uploader or an admin may delete a document record.
+      responses:
+        '204':
+          description: Document record deleted
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
